@@ -32,6 +32,7 @@ from typing import (
     Sequence,
     Tuple,
     TypeVar,
+    Union,
     cast,
 )
 
@@ -49,7 +50,7 @@ from icloudpd.email_notifications import send_2sa_notification
 from icloudpd.paths import clean_filename, local_download_path, remove_unicode_chars
 from icloudpd.server import serve_app
 from icloudpd.status import Status, StatusExchange
-from icloudpd.string_helpers import truncate_middle
+from icloudpd.string_helpers import parse_timestamp_or_timedelta, truncate_middle
 from icloudpd.xmp_sidecar import generate_xmp_file
 from pyicloud_ipd.base import PyiCloudService
 from pyicloud_ipd.exceptions import PyiCloudAPIResponseException
@@ -258,6 +259,27 @@ def file_match_policy_generator(
         return FileMatchPolicy.NAME_ID7
     else:
         raise ValueError(f"policy was provided with unsupported value of '{policy}'")
+
+
+def skip_created_before_generator(
+    _ctx: click.Context, _param: click.Parameter, formatted: str
+) -> Optional[Union[datetime.datetime, datetime.timedelta]]:
+    if formatted is None:
+        return None
+    result = parse_timestamp_or_timedelta(formatted)
+    if result is None:
+        raise ValueError(
+            "--skip-created-before parameter did not parse ISO timestamp or interval successfully"
+        )
+    if isinstance(result, datetime.datetime):
+        return ensure_tzinfo(get_localzone(), result)
+    return result
+
+
+def ensure_tzinfo(tz: datetime.tzinfo, input: datetime.datetime) -> datetime.datetime:
+    if input.tzinfo is None:
+        return input.astimezone(tz)
+    return input
 
 
 def locale_setter(_ctx: click.Context, _param: click.Parameter, use_os_locale: bool) -> bool:
@@ -571,6 +593,11 @@ CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
     callback=locale_setter,
 )
 @click.option(
+    "--skip-created-before",
+    help="Do not process assets created before specified timestamp in ISO format (2025-01-02) or interval from now (20d)",
+    callback=skip_created_before_generator,
+)
+@click.option(
     "--version",
     help="Show the version, commit hash and timestamp",
     is_flag=True,
@@ -625,6 +652,7 @@ def main(
     file_match_policy: FileMatchPolicy,
     mfa_provider: MFAProvider,
     use_os_locale: bool,
+    skip_created_before: Optional[Union[datetime.datetime, datetime.timedelta]],
 ) -> NoReturn:
     """Download all iCloud photos to a local directory"""
 
@@ -778,6 +806,7 @@ def main(
                 dry_run,
                 file_match_policy,
                 xmp_sidecar,
+                skip_created_before,
             )
             if directory is not None
             else (lambda _s: lambda _c, _p: False),
@@ -836,6 +865,7 @@ def download_builder(
     dry_run: bool,
     file_match_policy: FileMatchPolicy,
     xmp_sidecar: bool,
+    skip_created_before: Optional[Union[datetime.datetime, datetime.timedelta]],
 ) -> Callable[[PyiCloudService], Callable[[Counter, PhotoAsset], bool]]:
     """factory for downloader"""
 
@@ -865,6 +895,23 @@ def download_builder(
                     "Could not convert photo created date to local timezone (%s)", photo.created
                 )
                 created_date = photo.created
+
+            if skip_created_before is not None:
+                if isinstance(skip_created_before, datetime.timedelta):
+                    temp_created_before = (
+                        datetime.datetime.now(get_localzone()) - skip_created_before
+                    )
+                elif isinstance(skip_created_before, datetime.datetime):
+                    temp_created_before = skip_created_before
+                else:
+                    raise ValueError(
+                        f"skip-created-before is of unsupported type {type(skip_created_before)}"
+                    )
+                if created_date < temp_created_before:
+                    logger.debug(
+                        f"Skipping {photo.filename}, as it was created {created_date}, before {temp_created_before}."
+                    )
+                    return False
 
             if folder_structure.lower() == "none":
                 date_path = ""
@@ -1245,11 +1292,6 @@ def core(
         logger.info("Authentication completed successfully")
         return 0
 
-    download_photo = downloader(icloud)
-
-    # Access to the selected library. Defaults to the primary photos object.
-    library_object: PhotoLibrary = icloud.photos
-
     if list_libraries:
         library_names = (
             icloud.photos.private_libraries.keys() | icloud.photos.shared_libraries.keys()
@@ -1257,24 +1299,29 @@ def core(
         print(*library_names, sep="\n")
 
     else:
+        download_photo = downloader(icloud)
+
+        # After 6 or 7 runs within 1h Apple blocks the API for some time. In that
+        # case exit.
+        try:
+            # Access to the selected library. Defaults to the primary photos object.
+            library_object: PhotoLibrary = icloud.photos
+            if library:
+                if library in icloud.photos.private_libraries:
+                    library_object = icloud.photos.private_libraries[library]
+                elif library in icloud.photos.shared_libraries:
+                    library_object = icloud.photos.shared_libraries[library]
+                else:
+                    logger.error("Unknown library: %s", library)
+                    return 1
+        except PyiCloudAPIResponseException as err:
+            # For later: come up with a nicer message to the user. For now take the
+            # exception text
+            logger.error("error?? %s", err)
+            return 1
+
         while True:
-            # After 6 or 7 runs within 1h Apple blocks the API for some time. In that
-            # case exit.
-            try:
-                if library:
-                    if library in icloud.photos.private_libraries:
-                        library_object = icloud.photos.private_libraries[library]
-                    elif library in icloud.photos.shared_libraries:
-                        library_object = icloud.photos.shared_libraries[library]
-                    else:
-                        logger.error("Unknown library: %s", library)
-                        return 1
-                photos = library_object.albums[album] if album else library_object.all
-            except PyiCloudAPIResponseException as err:
-                # For later: come up with a nicer message to the user. For now take the
-                # exception text
-                logger.error("error?? %s", err)
-                return 1
+            photos = library_object.albums[album] if album else library_object.all
 
             if list_albums:
                 print("Albums:")
